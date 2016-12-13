@@ -8,6 +8,7 @@ from threading import Thread
 import queue
 import time
 import bs4
+import re
 
 class JobType(Enum):
     SYMPTOM_LIST = 0,
@@ -123,8 +124,8 @@ class MayoWorker(Thread):
         content = MayoBase.request(kwargs["address"], "symptom")
 
     def scrape_causes(self, **kwargs):
-        content = MayoBase.request(kwargs["address"], "causes")
-        tree = bs4.BeautifulSoup(content)
+        content = MayoBase.request(kwargs["address"], "symcauses")
+        tree = bs4.BeautifulSoup(content, "lxml")
         causeLinks = tree.select("div#main-content > ol > li > a")
         for cause in causeLinks:
             # self.queue.put({"disease": JobType.})
@@ -133,7 +134,7 @@ class MayoWorker(Thread):
 
     def scrape_disease(self, **kwargs):
         content = MayoBase.request(kwargs["address"], "disease")
-        tree = bs4.BeautifulSoup(content)
+        tree = bs4.BeautifulSoup(content, "lxml")
 
 
     def make_address(self, *args):
@@ -159,24 +160,66 @@ class MayoScraper(MayoBase):
             worker = MayoWorker(self.jobs)
             worker.start()
 
+def id_from_str(value):
+    mo = re.search(r"([0-9]+)$", value)
+    if mo == None:
+        return None
+    return mo.group(0)
+
+def _collect_data(basedir):
+    '''
+    Collects the data from basedir in unprocessed form.
+    :param basedir:
+    :return: a list. Each entry is a tuple comprising of:
+    id - the id of a symptom
+    name - the name of a symptom (may contain a synonym in parentheses
+    causes - a list of cause-tuples, each tuple comprising of
+        id - the id of the cause
+        name - the name of the cause (may contain a synonym in parentheses
+    '''
+    causespath = os.path.join(basedir, "symcauses")
+    data = []
+    for fn in os.listdir(causespath):
+        path = os.path.join(causespath, fn)
+        if os.path.isfile(path):
+
+            with open(path, mode="r") as f:
+                tree = bs4.BeautifulSoup(f, "lxml")
+
+                causeLinks = tree.select("div#main-content > ol > li > a")
+                causes = []
+                for causel in causeLinks:
+                    causeId = id_from_str(causel["href"])
+                    causes.append((causeId, causel.getText().strip()))
+
+                symptom = tree.select("div.headers > h1 > a")[0].getText()
+                symptomId = id_from_str(fn)
+                data.append((symptomId, symptom, causes))
+
+
+    return data
 
 def process_dataset(basedir):
     '''
 
-    :param basedir: base dir to process. It should have subdirectories symptom and causes
+    :param basedir: base dir to process. It should have subdirectories symptom and symcauses
     :return: a dictionary of disease-symptomlist pairs
     '''
-    pass
+
+    data = _collect_data(basedir)
+    print(data)
+    symptomCauses = {}
 
 
 
 
-m = MayoScraper()
-m.scrape()
-# q = Queue()
-# m = MayoSymptomWorker(q)
-# m.start()
-#
-# page = requests.get("http://econpy.pythonanywhere.com/ex/001.html")
-# tree=html.fromstring(page.content)
-print()
+
+def main():
+    process_dataset(MayoBase.BASE_DIR)
+
+
+    m = MayoScraper()
+    m.scrape()
+
+if __name__ == "__main__":
+    main()
