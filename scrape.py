@@ -9,16 +9,40 @@ import queue
 import time
 import bs4
 import re
+import pandas as pd
 
 class JobType(Enum):
-    SYMPTOM_LIST = 0,
-    SYMPTOM = 1,
-    CAUSES = 2,
+    SYMPTOM_LIST = 0
+    SYMPTOM = 1
+    CAUSES = 2
     DISEASE = 3
+
+class CauseType(Enum):
+    DISEASE = 0 # and conditions
+    PROCEDURE = 1
+    HEALTHY_LIFESTYLE = 2
+    SYMPTOM = 3
+    FIRST_AID = 4
+    OTHER = 5
+
 
 class MayoBase:
     valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
     BASE_DIR = "mayo"
+    causeType = {"Diseases and Conditions": CauseType.DISEASE,
+                 "Diseases & Conditions": CauseType.DISEASE,
+                 "Tests and Procedures": CauseType.PROCEDURE,
+                 "Tests & Procedures": CauseType.PROCEDURE,
+                 "Healthy Lifestyle": CauseType.HEALTHY_LIFESTYLE,
+                 "Symptoms": CauseType.SYMPTOM,
+                 "First aid": CauseType.FIRST_AID,
+                 "Other": CauseType.OTHER
+                 }
+
+    @staticmethod
+    def cause_name_to_type(causeName):
+        return MayoBase.causeType[causeName]
+
     @staticmethod
     def request(address, prefixDir):
         path = MayoBase.address_to_path(address, prefixDir)
@@ -30,7 +54,6 @@ class MayoBase:
         else:
             print("Requesting:", address)
             content = MayoBase._request_address(address)
-
 
             with open(path, 'w', encoding="utf-8") as f:
                 f.write(content)
@@ -132,6 +155,7 @@ class MayoWorker(Thread):
             href = cause["href"]
             self.queue.put({"type" : JobType.DISEASE, "address" : href})
 
+
     def scrape_disease(self, **kwargs):
         content = MayoBase.request(kwargs["address"], "disease")
         tree = bs4.BeautifulSoup(content, "lxml")
@@ -166,7 +190,7 @@ def id_from_str(value):
         return None
     return mo.group(0)
 
-def _collect_data(basedir):
+def _collect_symcause_data(basedir):
     '''
     Collects the data from basedir in unprocessed form.
     :param basedir:
@@ -199,27 +223,144 @@ def _collect_data(basedir):
 
     return data
 
+class Cause:
+    def __init__(self, id, causeType, names):
+        self.id = id
+        self.type = causeType
+        self.names = names
+        self.symptoms = []
+
+    def add_symptom(self, symptom):
+        self.symptoms.append(symptom)
+
+def _collect_cause_details(basedir):
+    '''
+
+    :param basedir:
+    :return: Dictionary with causeIds as keys, and Cause as value.
+    '''
+    causespath = os.path.join(basedir, "disease")
+    data = {}
+    for fn in os.listdir(causespath):
+        path = os.path.join(causespath, fn)
+        if os.path.isfile(path):
+            with open(path, mode="r") as f:
+                causeId = id_from_str(fn)
+                tree = bs4.BeautifulSoup(f, "lxml")
+                causetLink = tree.select("div.headers > a")
+                nameLink = tree.select("div.headers > h1 > a")
+
+                if len(causetLink) == 0: # There's exactly one known faq-page where these two if-statements have different evaluation result
+                    causetLink = tree.select("header > div.row > div.breadcrumbs > ul > li > a")
+                if len(nameLink) == 0:
+                    nameLink = tree.select("div.main > header > div.row > h1 > a")
+
+                if len(causetLink) > 0:
+                    causetLink = causetLink[-1]
+
+                    causeTypeName = causetLink.getText()
+                else:
+                    causeTypeName = "Other"
+                if len(nameLink) > 0:
+                    name = nameLink[0].getText()
+                    names = _name_to_names(name)
+                else:
+                    print("unknown name: ", fn)
+                try:
+                    causeType = MayoBase.cause_name_to_type(causeTypeName)
+                    data[causeId] = Cause(causeId, causeType, names=names)
+                except KeyError:
+                    print("CauseType not found:", causeTypeName, "\nSkipping...")
+
+    return data
+
+def _name_to_names(rawname, excludeList=["male", "female", "body", "scalp"]):
+    '''
+    A name parameter of the following forms:
+    name1 (name3)
+    name2
+    :param rawname:
+    :return: A list of names in the string. For example, for rawname="name1 (name3)" returns [name1, name3]
+    '''
+    names = []
+    mo = re.match(r"([^(]+)(\([^)]*\))?", rawname)
+
+    for group in mo.groups():
+        if group:
+            group = re.sub("[()]", "", group)
+            if group not in excludeList:
+                names.append(group.strip())
+            else:
+                return [rawname.strip()]
+    return names
+
+
 def process_dataset(basedir):
     '''
 
     :param basedir: base dir to process. It should have subdirectories symptom and symcauses
     :return: a dictionary of disease-symptomlist pairs
     '''
+    symptomData = _collect_symcause_data(basedir)
+    causeData = _collect_cause_details(basedir)
+    symptomIds = {}
+    causeIds = {}
+    for entry in symptomData:
+        symptomId = entry[0]
+        symptomraw = entry[1]
 
-    data = _collect_data(basedir)
-    print(data)
-    symptomCauses = {}
+        symptomIds[symptomId] = _name_to_names(symptomraw)
+    for entry in symptomData:
+        symId = entry[0]
+        for cause in entry[2]:
+            id = cause[0]
+            name = cause[1]
+            causeIds[id] = name
+            causeData[id].add_symptom(symId)
 
+    return causeData, symptomIds
+
+def mayo_to_csv(dataBaseDir, exportPath):
+    if not os.path.exists(exportPath):
+        os.mkdir(exportPath)
+    causeData, symptomIds = process_dataset(dataBaseDir)
+    causeSymptoms = {cause.id : cause.symptoms for cause in causeData.values()
+                     if cause.type == CauseType.DISEASE and len(cause.symptoms) > 0}
+
+    causeVecPath = os.path.join(exportPath, "causesym.csv")
+    with open(causeVecPath, mode="w") as f:
+        f.write("Id;Symptoms\n")
+        for cause,symptoms in causeSymptoms.items():
+            f.write("%s;%s\n" % (cause, ",".join(symptoms)))
+
+    causeDetailsPath = os.path.join(exportPath, "causedetails.csv")
+    with open(causeDetailsPath, mode="w") as f:
+        f.write(";".join(["Id", "Type", "Name"]) + "\n")
+        for cause in causeData.values():
+            f.write("%s;%s;%s\n" % (cause.id, cause.type.value, ",".join(cause.names)))
+
+
+    symptomDetailsPath = os.path.join(exportPath, "symptomDetails.csv")
+    with open(symptomDetailsPath, mode="w") as f:
+        f.write(";".join(["Id", "Name"]) + "\n")
+        for symptomId, symptomNames in symptomIds.items():
+            f.write("%s;%s\n" % (symptomId, ",".join(symptomNames)))
+
+
+
+
+def load_data(reuse = True):
+    path = "mayoexport"
+    if not reuse or not os.path.exists(path):
+        mayo_to_csv(MayoBase.BASE_DIR, path)
 
 
 
 
 def main():
-    process_dataset(MayoBase.BASE_DIR)
-
-
-    m = MayoScraper()
-    m.scrape()
+    load_data(reuse=False)
+    # m = MayoScraper()
+    # m.scrape()
 
 if __name__ == "__main__":
     main()
