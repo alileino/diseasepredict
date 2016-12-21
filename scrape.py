@@ -1,5 +1,7 @@
 import string
 import os
+
+from IPython.core.release import description
 from lxml import html
 import requests
 from queue import Queue
@@ -12,6 +14,7 @@ import re
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.preprocessing import LabelEncoder
 
 SYMPTOM_DETAILS_CSV = "symptomDetails.csv"
 
@@ -180,9 +183,9 @@ class MayoScraper(MayoBase):
     '''
     BASE_ADDRESS = "http://www.mayoclinic.org"
     LINKS_ADDRESS = "/symptoms/index?letter="
-    def __init__(self):
+    def __init__(self, numWorkers=1):
         self.jobs = Queue()
-        self.numWorkers = 1
+        self.numWorkers = numWorkers
 
     def scrape(self):
         for letter in string.ascii_uppercase:
@@ -235,11 +238,12 @@ def _collect_symcause_data(basedir):
     return data
 
 class Cause:
-    def __init__(self, id, causeType, names):
+    def __init__(self, id, causeType, names, description=None):
         self.id = id
         self.type = causeType
         self.names = names
         self.symptoms = []
+        self.description = description
 
     def add_symptom(self, symptom):
         self.symptoms.append(symptom)
@@ -277,9 +281,16 @@ def _collect_cause_details(basedir):
                     names = _name_to_names(name)
                 else:
                     print("unknown name: ", fn)
+                descElement = tree.select("#main-content > p:nth-of-type(1)")
+                if len(descElement) > 0:
+                    description = descElement[0].getText()
+                    description = description.replace(";", ".").replace("\n", "")
+
+                else:
+                    description = "No description available"
                 try:
                     causeType = MayoBase.cause_name_to_type(causeTypeName)
-                    data[causeId] = Cause(causeId, causeType, names=names)
+                    data[causeId] = Cause(causeId, causeType, names=names, description=description)
                 except KeyError:
                     print("CauseType not found:", causeTypeName, "\nSkipping...")
 
@@ -346,9 +357,9 @@ def mayo_to_csv(dataBaseDir, exportPath):
 
     causeDetailsPath = os.path.join(exportPath, CAUSEDETAILS_CSV)
     with open(causeDetailsPath, mode="w") as f:
-        f.write(";".join(["Id", "Type", "Name"]) + "\n")
+        f.write(";".join(["Id", "Type", "Name", "Description"]) + "\n")
         for cause in causeData.values():
-            f.write("%s;%s;%s\n" % (cause.id, cause.type.value, ",".join(cause.names)))
+            f.write("%s;%s;%s;%s\n" % (cause.id, cause.type.value, ",".join(cause.names), cause.description))
 
 
     symptomDetailsPath = os.path.join(exportPath, SYMPTOM_DETAILS_CSV)
@@ -361,7 +372,7 @@ def mayo_to_csv(dataBaseDir, exportPath):
 
 
 def load_data(reuse = True, basedir=DEFAULT_EXPORT_PATH):
-    basedir
+
     if not reuse or not os.path.exists(basedir):
         mayo_to_csv(MayoBase.BASE_DIR, basedir)
 
@@ -377,13 +388,14 @@ class MayoDataProvider:
         self._load_causesym(basedir, causeTypeFilter=causeTypeFilter)
         self._load_symptom_details(basedir)
         self._filter_cause_types(causeTypeFilter)
-        print(len(self.X))
 
     def _load_causesym(self, basedir, causeTypeFilter=None):
         path = os.path.join(basedir, CAUSESYM_CSV)
         df = pd.read_csv(path, sep=";")
-        temp = {id : value[0] for id,value in self.causes.items()}
+        temp = {id: value[0] for id,value in self.causes.items()}
+
         df["Type"] = df.Id.map(temp)
+
         # df["Type"] = pd.Series(index=[np.int64(t[0]) for t in temp], data=[np.int64(t[1]) for t in temp])
         if causeTypeFilter != None:
             df = df[df.Type == causeTypeFilter.value]
@@ -391,11 +403,16 @@ class MayoDataProvider:
         symptoms = df[["Symptoms"]].values
         symptoms = [vec[0].split(",") for vec in symptoms]
         symptoms = [tuple(np.int64(vec)) for vec in symptoms]
+
         self.causesym = dict(zip(df.Id, symptoms))
 
         self.mlb = MultiLabelBinarizer()
+
         self.X = self.mlb.fit_transform(symptoms)
-        self.y = df["Id"].values
+
+        self.lv = LabelEncoder()
+
+        self.y = self.lv.fit_transform(df["Id"].values)
 
     def _load_symptom_details(self, basedir):
         path = os.path.join(basedir, SYMPTOM_DETAILS_CSV)
@@ -405,7 +422,7 @@ class MayoDataProvider:
     def _load_cause_details(self, basedir):
         path = os.path.join(basedir, CAUSEDETAILS_CSV)
         df = pd.read_csv(path, sep=";")
-        self.causes = dict(zip(df.Id, zip(df.Type, df.Name)))
+        self.causes = dict(zip(df.Id, zip(df.Type, df.Name, df.Description)))
 
     def _filter_cause_types(self, causeTypeFilter):
         if causeTypeFilter == None:
@@ -413,15 +430,24 @@ class MayoDataProvider:
         # self.causes = {id : value for id,value in self.causes if value[1] == causeTypeFilter}
         # self.causesym = {id : value for id,value in self.causesym if id in self.causes}
 
-    def inverse_transform(self, X):
+    def inverse_transform_symptoms(self, X):
         return self.mlb.inverse_transform(X)
+
+    def inverse_transform_causes(self, y):
+        return self.lv.inverse_transform(y)
+
+    def transform_symptoms(self, X):
+        return self.mlb.transform(X)
+
+    def transform_causes(self, y):
+        return self.lv.transform(y)
 
     def explain_symptoms(self, X):
         '''
         :param X: A transformed indicator matrix
         :return: Matrix where each indicator element has been transformed to symptom string
         '''
-        X = self.inverse_transform(X)
+        X = self.inverse_transform_symptoms(X)
 
         return [[self.symptoms[id] for id in x] for x in X]
 
@@ -429,17 +455,22 @@ class MayoDataProvider:
     def explain_causes(self, y):
         '''
 
-        :param y: ID iterable of causes
+        :param y: Encoded labels of causes
         :return: List of cause names
         '''
+        y = self.inverse_transform_causes(y)
         return [self.causes[id][1] for id in y]
+
+    def describe(self, cause):
+        return self.causes[self.inverse_transform_causes(cause)][-1]
 
     def explain(self, X, y):
         return self.explain_symptoms(X), self.explain_causes(y)
 
 def main():
-    # load_data(reuse=False)
+    load_data(reuse=False)
     dp = MayoDataProvider("mayoexport", causeTypeFilter=CauseType.DISEASE)
+
     # print(dp.explain_symptoms(dp.X))
     # print(dp.explain_causes(dp.y))
     # m = MayoScraper()
